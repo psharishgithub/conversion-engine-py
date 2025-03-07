@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+asyncpg
+numpy
+openai
+# scikit-learn
+# nltk
+# transformers
+# torch
+PyPDF2
+python-docx
+python-pptx
