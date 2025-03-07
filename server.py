@@ -10,6 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
+from fastapi.responses import StreamingResponse
+import json
+import asyncio
 
 app = FastAPI()
 app.add_middleware(
@@ -232,73 +235,126 @@ async def chat(request: ChatRequest):
     if not request.question:
         raise HTTPException(status_code=400, detail="Question is required")
 
-    # Connect to the database
-    conn = await connect_db()
-    try:
-        # Retrieve stored embeddings for the given subject
-        embeddings = await conn.fetch('''
-            SELECT "chunkId", "text", "vector"
-            FROM "Embedding"
-            WHERE "subjectId" = $1
-        ''', request.subject_id)
-        
-        if not embeddings:
-            raise HTTPException(status_code=404, detail="No embeddings found for the given subject")
+    async def generate_response():
+        conn = await connect_db()
+        try:
+            # Check if it's a greeting
+            greetings = ['hi', 'hello', 'hey', 'hi there', 'hello there']
+            is_greeting = request.question.lower().strip() in greetings
 
-        # Get the embedding for the user's question
-        question_embedding = await get_embedding(request.question)
+            if is_greeting:
+                greeting_response = {
+                    "content": "Hello! I'm your AI teaching assistant. I'm here to help you understand your subject materials better. What topic would you like to explore today?"
+                }
+                yield json.dumps(greeting_response) + "\n"
+                return
 
-        # Find the most relevant chunk based on cosine similarity
-        best_chunk = None
-        best_similarity = -1
-
-        for embedding in embeddings:
-            chunk_embedding = np.array(embedding['vector'])
-            similarity = np.dot(question_embedding, chunk_embedding) / (np.linalg.norm(question_embedding) * np.linalg.norm(chunk_embedding))
+            # Rest of the embedding retrieval logic
+            embeddings = await conn.fetch('''
+                SELECT "chunkId", "text", "vector"
+                FROM "Embedding"
+                WHERE "subjectId" = $1
+            ''', request.subject_id)
             
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_chunk = embedding['text']
+            if not embeddings:
+                yield json.dumps({"error": "No embeddings found"}) + "\n"
+                return
 
-        if best_chunk is None:
-            raise HTTPException(status_code=404, detail="No relevant content found")
+            question_embedding = await get_embedding(request.question)
+            
+            # Find best chunk (same logic as before)
+            best_chunk = None
+            best_similarity = -1
 
-        # Generate a chat completion based on the best matching chunk
-        prompt = f"""Based on the following information, please answer the question.
-        Note: Respond with Markdowns
+            for embedding in embeddings:
+                chunk_embedding = np.array(embedding['vector'])
+                similarity = np.dot(question_embedding, chunk_embedding) / (np.linalg.norm(question_embedding) * np.linalg.norm(chunk_embedding))
+                
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_chunk = embedding['text']
 
-Information:
-{best_chunk}
+            if best_chunk is None:
+                yield json.dumps({"error": "No relevant content found"}) + "\n"
+                return
 
-Question: {request.question}
+            # Enhanced context-aware prompt with better formatting instructions
+            prompt = f"""As a teaching assistant, help the student understand this topic. Structure your response following these specific formatting rules:
 
-Answer:"""
+            1. Start with a clear main heading using # (Example: # Topic Title)
+            2. Use ## for major subtopics with double line breaks before and after
+            3. Use ### for smaller subtopics with single line breaks
+            4. Use bold (**text**) for important terms and concepts
+            5. Use bullet points with proper indentation
+            6. Use `code blocks` for specific terms, formulas, or technical details
+            7. Add horizontal lines (---) between major sections
 
-        completion = client.chat.completions.create(
-            model="lmstudio-community/Meta-Llama-3-8B-Instruct-GGUF",
-            messages=[
-                {"role": "system", "content": "You are an educational assistant. You help in elaborating Resource material and Give a stuctured notes"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-        )
+            Use this reference material to inform your response:
+            {best_chunk}
 
-        # Access the response correctly
-        response_message = completion.choices[0].message.content
-        
-        return {
-            "question": request.question,
-            "answer": response_message,
-            "relevant_chunk": best_chunk
+            Student's question: {request.question}
+
+            Format your response using this structure:
+            
+            # Main Topic
+            
+            Brief introduction
+            
+            ## Key Concepts
+            
+            * **Important term**: Definition or explanation
+            * **Another term**: Description
+            
+            ## Detailed Explanation
+            
+            ### Subtopic 1
+            Explanation with `specific terms` highlighted
+            
+            ### Subtopic 2
+            More details with examples
+            
+            ---
+            
+            ## Summary
+            Concise recap of main points
+
+            Response:"""
+
+            # Stream the completion with enhanced role
+            stream = client.chat.completions.create(
+                model="lmstudio-community/Meta-Llama-3-8B-Instruct-GGUF",
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": """You are an experienced teaching assistant who creates well-structured, visually organized notes. 
+                        Always use proper Markdown formatting with consistent spacing and highlighting of key concepts. 
+                        Make sure to separate sections with appropriate line breaks and use emphasis markers for important terms."""
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                stream=True
+            )
+
+            for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    yield json.dumps({"content": chunk.choices[0].delta.content}) + "\n"
+                    await asyncio.sleep(0.05)
+
+        except Exception as e:
+            yield json.dumps({"error": str(e)}) + "\n"
+        finally:
+            await conn.close()
+
+    return StreamingResponse(
+        generate_response(),
+        media_type='text/event-stream',
+        headers={
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
         }
-    except asyncpg.exceptions.PostgresError as e:
-        print(f"Database error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred")
-    finally:
-        await conn.close()
+    )
 
 if __name__ == "__main__":
     import uvicorn
